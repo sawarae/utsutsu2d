@@ -4,10 +4,7 @@ A pure Dart puppet animation library for Flutter, inspired by [Inochi2D](https:/
 
 Loads and renders `.inp` (Inochi2D Puppet) and `.inx` (Inochi2D eXtended) model files with support for:
 
-- Mesh deformation and compositing
 - Blend shapes and parameter-driven animation
-- Simple physics (pendulum simulation)
-- JSON-based animation playback
 
 ## Requirements
 
@@ -51,6 +48,7 @@ flutter run -d macos
 - Inspired by [Inochi2D](https://inochi2d.com/) by the Inochi2D Project
 - Rust reference implementation: [inox2d](https://github.com/Inochi2D/inox2d)
 
+
 ## つくよみちゃんについて
 
 このアプリでは、フリー素材キャラクター「[つくよみちゃん](https://tyc.rei-yumesaki.net/)」（© Rei Yumesaki）を使用しています。
@@ -60,6 +58,3 @@ flutter run -d macos
 - **素材配布URL:** <https://tyc.rei-yumesaki.net/material/illust/>
 - **利用規約:** <https://tyc.rei-yumesaki.net/about/terms/>
 
-## License
-
-MIT

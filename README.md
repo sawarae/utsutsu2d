@@ -49,6 +49,10 @@ flutter run -d macos
 - Inspired by [Inochi2D](https://inochi2d.com/) by the Inochi2D Project
 - Rust reference implementation: [inox2d](https://github.com/Inochi2D/inox2d)
 
+## Known Issues
+
+- **inox2d opacity bindings**: `BindingValues::Opacity` is unimplemented in inox2d (`params.rs` — `// TODO` no-op). Our INP format is spec-compliant, but opacity-driven blend shapes (e.g. expression switching) do not render in inox2d. Works correctly in utsutsu2d's Dart renderer.
+
 
 ## つくよみちゃんについて
 

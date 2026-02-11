@@ -49,13 +49,25 @@ flutter run -d macos
 - Inspired by [Inochi2D](https://inochi2d.com/) by the Inochi2D Project
 - Rust reference implementation: [inox2d](https://github.com/Inochi2D/inox2d)
 
+## Known Issues
+
+- **inox2d opacity bindings**: `BindingValues::Opacity` is unimplemented in inox2d (`params.rs` — `// TODO` no-op). Our INP format is spec-compliant, but opacity-driven blend shapes (e.g. expression switching) do not render in inox2d. Works correctly in utsutsu2d's Dart renderer.
+
 
 ## つくよみちゃんについて
 
 このアプリでは、フリー素材キャラクター「[つくよみちゃん](https://tyc.rei-yumesaki.net/)」（© Rei Yumesaki）を使用しています。
 
-- **素材名:** つくよみちゃん万能立ち絵素材
+### つくよみちゃん万能立ち絵素材
+
 - **素材制作者:** 花兎\*
 - **素材配布URL:** <https://tyc.rei-yumesaki.net/material/illust/>
 - **利用規約:** <https://tyc.rei-yumesaki.net/about/terms/>
+
+### つくよみちゃん万能ミニキャラ素材
+
+- **素材制作者:** きばやし
+- **素材配布URL:** <https://tyc.rei-yumesaki.net/material/illust/>
+- **利用規約:** <https://tyc.rei-yumesaki.net/about/terms/>
+- **ニコニコ静画:** [im11318256](https://seiga.nicovideo.jp/seiga/im11318256)
 

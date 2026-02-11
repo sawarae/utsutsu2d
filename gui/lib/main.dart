@@ -414,9 +414,16 @@ class _ViewerPageState extends State<ViewerPage>
   String? _activeExpression;
 
   void _applyExpression(String name, Map<String, double> values) {
-    for (final entry in values.entries) {
-      _controller!.setParameter(entry.key, entry.value);
+    final puppet = _controller!.puppet;
+    if (puppet == null) return;
+    // Batch: reset all parameters to defaults, then apply expression values
+    for (final param in puppet.params) {
+      puppet.setParam(param.name, param.defaultValue.x, param.defaultValue.y);
     }
+    for (final entry in values.entries) {
+      puppet.setParam(entry.key, entry.value);
+    }
+    _controller!.updateManual();
     setState(() {
       _activeExpression = name;
     });

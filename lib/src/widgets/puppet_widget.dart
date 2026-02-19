@@ -259,6 +259,23 @@ class PuppetController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Set manual per-vertex offset override for a specific node.
+  ///
+  /// [offsets] must have the same length as the node's mesh vertex count.
+  /// Pass null to clear the override for that node.
+  /// The offsets are in local mesh space and are added on top of any
+  /// parameter-driven deformation.
+  void setManualVertexOverride(int nodeId, List<Vec2>? offsets) {
+    _model?.puppet.renderCtx?.setVertexOverride(nodeId, offsets);
+    notifyListeners();
+  }
+
+  /// Clear all manual vertex overrides.
+  void clearManualVertexOverrides() {
+    _model?.puppet.renderCtx?.clearVertexOverrides();
+    notifyListeners();
+  }
+
   /// Updates the puppet state without advancing physics time.
   ///
   /// This method is useful for manual parameter control when animation

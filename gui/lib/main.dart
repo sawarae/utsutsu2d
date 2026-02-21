@@ -378,6 +378,22 @@ class _ViewerPageState extends State<ViewerPage>
               tooltip: _controller!.isPlaying ? 'Pause' : 'Play',
             ),
             IconButton(
+              icon: Icon(
+                _controller!.renderer?.showMeshOverlay == true
+                    ? Icons.grid_on
+                    : Icons.grid_off,
+              ),
+              onPressed: () {
+                final renderer = _controller!.renderer;
+                if (renderer != null) {
+                  renderer.showMeshOverlay = !renderer.showMeshOverlay;
+                  _controller!.updateManual();
+                  setState(() {});
+                }
+              },
+              tooltip: 'Mesh overlay',
+            ),
+            IconButton(
               icon: const Icon(Icons.camera_alt),
               onPressed: () => _saveScreenshot(),
               tooltip: 'Screenshot',

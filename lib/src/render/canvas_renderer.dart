@@ -21,6 +21,9 @@ class CanvasRenderer {
 
   bool _shaderLoadAttempted = false;
 
+  /// When true, draw a wireframe overlay on top of the rendered puppet.
+  bool showMeshOverlay = false;
+
   CanvasRenderer({
     required this.renderCtx,
     Camera? camera,
@@ -70,6 +73,29 @@ class CanvasRenderer {
       canvas.restore();
     }
 
+    canvas.restore();
+
+    if (showMeshOverlay) {
+      _drawMeshOverlayPass(canvas, size);
+    }
+  }
+
+  /// Draw wireframe overlay for all visible drawables.
+  void _drawMeshOverlayPass(Canvas canvas, Size size) {
+    canvas.save();
+    _applyMatrix(
+        canvas, camera.viewProjectionMatrix(size.width, size.height), size);
+    for (final data in renderCtx.drawables) {
+      if (renderCtx.isNodeHidden(data.nodeId)) continue;
+      final mesh = data.mesh;
+      if (mesh == null) continue;
+      final vertices = data.deformedVertices ?? mesh.vertices;
+      if (vertices.isEmpty) continue;
+      canvas.save();
+      _applyNodeTransform(canvas, data.transform);
+      _drawWireframe(canvas, vertices, mesh.indices);
+      canvas.restore();
+    }
     canvas.restore();
   }
 

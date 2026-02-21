@@ -1,6 +1,7 @@
 import 'dart:math' show sqrt;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:dart_psd_tool/dart_psd_tool.dart';
 import 'package:flutter/material.dart';
 import '../core/core.dart';
 import '../math/math.dart';
@@ -14,6 +15,10 @@ class CanvasRenderer {
 
   /// GPU fragment shader for mask thresholding (null = use ColorFilter fallback)
   ui.FragmentProgram? _maskShaderProgram;
+
+  /// PSDTool-compatible GPU compositor (null = use Flutter built-in BlendMode)
+  PsdCanvasCompositor? psdCompositor;
+
   bool _shaderLoadAttempted = false;
 
   CanvasRenderer({
@@ -32,10 +37,13 @@ class CanvasRenderer {
       _maskShaderProgram = await ui.FragmentProgram.fromAsset(
         'packages/utsutsu2d/lib/src/render/shaders/mask_threshold.frag',
       );
-      // Shader loaded successfully
     } catch (e) {
-      // Shader unavailable — ColorFilter fallback will be used
       _maskShaderProgram = null;
+    }
+    try {
+      psdCompositor = await PsdCanvasCompositor.create();
+    } catch (e) {
+      psdCompositor = null;
     }
   }
 
@@ -43,23 +51,223 @@ class CanvasRenderer {
   void render(Canvas canvas, Size size, Puppet puppet) {
     canvas.save();
 
-    // Apply camera transform
-    final viewProjection = camera.viewProjectionMatrix(size.width, size.height);
-    _applyMatrix(canvas, viewProjection, size);
+    if (psdCompositor != null) {
+      // PSD-accurate compositing: running buffer with shader blending.
+      // Camera transform is applied internally per-picture.
+      _renderWithPsdCompositor(canvas, size, puppet);
+    } else {
+      // Fast path: Flutter built-in blend modes (approximate).
+      final viewProjection =
+          camera.viewProjectionMatrix(size.width, size.height);
+      _applyMatrix(canvas, viewProjection, size);
 
-    // Isolate puppet rendering in a transparent compositing layer.
-    // Without this, drawables with multiply (or other) blend modes that
-    // are not inside a Composite node blend directly against the canvas
-    // background (e.g. gray), producing incorrect colors (Issue #4).
-    // Inside this layer, blend modes only interact with previously drawn
-    // puppet content, matching PSD compositing behavior.
-    canvas.saveLayer(null, Paint());
+      // Isolate puppet rendering in a transparent compositing layer.
+      // Without this, drawables with multiply (or other) blend modes that
+      // are not inside a Composite node blend directly against the canvas
+      // background (e.g. gray), producing incorrect colors (Issue #4).
+      canvas.saveLayer(null, Paint());
+      _drawAllDrawables(canvas, puppet);
+      canvas.restore();
+    }
 
-    // Draw all drawables
-    _drawAllDrawables(canvas, puppet);
-
-    canvas.restore(); // compositing layer
     canvas.restore();
+  }
+
+  /// PSD-accurate rendering using a running buffer and shader compositing.
+  ///
+  /// Maintains a screen-space image buffer. Normal-blend drawables are
+  /// accumulated in a batch (PictureRecorder). When a non-normal textured
+  /// mesh is encountered, the batch is flushed and the mesh is composited
+  /// using the PSD fragment shader for exact 3-component alpha blending.
+  void _renderWithPsdCompositor(
+      Canvas targetCanvas, Size size, Puppet puppet) {
+    final w = size.width.ceil();
+    final h = size.height.ceil();
+    if (w <= 0 || h <= 0) return;
+
+    // Running destination image (screen space, accumulates composited content)
+    ui.Image? runningDst;
+
+    // Batch management: accumulate normal drawables
+    ui.PictureRecorder? batchRec;
+    Canvas? batchCvs;
+    bool batchDirty = false;
+
+    void startBatch() {
+      batchRec = ui.PictureRecorder();
+      batchCvs = Canvas(batchRec!);
+      // Draw existing content as base so blend modes within the batch
+      // interact with all prior content correctly.
+      if (runningDst != null) {
+        batchCvs!.drawImage(runningDst!, Offset.zero, Paint());
+      }
+      // Apply camera transform for subsequent world-space drawing
+      _applyMatrix(batchCvs!,
+          camera.viewProjectionMatrix(size.width, size.height), size);
+      // Isolate new drawing in a saveLayer (same as fast path) so blend
+      // modes don't interact with the runningDst base image directly.
+      if (runningDst != null) {
+        batchCvs!.saveLayer(null, Paint());
+      }
+      batchDirty = false;
+    }
+
+    void flushBatch() {
+      if (batchRec == null) return;
+      if (!batchDirty && runningDst != null) {
+        // Nothing new was drawn; discard recorder
+        if (runningDst != null) batchCvs!.restore(); // saveLayer
+        batchRec!.endRecording().dispose();
+        batchRec = null;
+        batchCvs = null;
+        return;
+      }
+      if (runningDst != null) batchCvs!.restore(); // saveLayer
+      final picture = batchRec!.endRecording();
+      final batchImage = picture.toImageSync(w, h);
+      picture.dispose();
+      batchRec = null;
+      batchCvs = null;
+      // The batch already includes runningDst as base → replace
+      runningDst?.dispose();
+      runningDst = batchImage;
+    }
+
+    startBatch();
+
+    for (final data in renderCtx.drawables) {
+      if (renderCtx.isNodeHidden(data.nodeId)) continue;
+
+      if (_needsPsdShaderPath(data)) {
+        // Flush any accumulated normal drawables
+        flushBatch();
+
+        // Render mesh content to image (normal blend, full opacity)
+        final srcImage = _renderMeshContentToImage(data, size, w, h);
+        if (srcImage == null) {
+          startBatch();
+          continue;
+        }
+
+        // Ensure dst exists
+        runningDst ??= _createTransparentImage(w, h);
+
+        // PSD shader composite
+        final compRec = ui.PictureRecorder();
+        final compCvs = Canvas(compRec);
+        psdCompositor!.composite(
+          compCvs,
+          srcImage,
+          runningDst!,
+          Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+          opacity: data.drawable.opacity,
+          blendMode: _puppetBlendModeToPsdString(data.drawable.blendMode),
+        );
+        final compPicture = compRec.endRecording();
+        final composited = compPicture.toImageSync(w, h);
+        compPicture.dispose();
+        runningDst!.dispose();
+        srcImage.dispose();
+        runningDst = composited;
+
+        // Start new batch (with updated runningDst as base)
+        startBatch();
+      } else {
+        // Normal path: draw to batch
+        _drawRenderable(batchCvs!, data, puppet);
+        batchDirty = true;
+      }
+    }
+
+    // Flush final batch
+    flushBatch();
+
+    // Draw final result to target canvas (screen space)
+    if (runningDst != null) {
+      targetCanvas.drawImage(runningDst!, Offset.zero, Paint());
+      runningDst!.dispose();
+    }
+  }
+
+  /// Whether this drawable should use the PSD shader compositing path.
+  bool _needsPsdShaderPath(RenderData data) {
+    if (psdCompositor == null) return false;
+    if (data.kind != DrawableKind.texturedMesh) return false;
+    if (data.drawable.hasMasks) return false;
+    final mode = data.drawable.blendMode;
+    if (mode == puppet.BlendMode.normal) return false;
+    // Inochi2d-specific modes without PSD equivalent — use Flutter built-in
+    if (mode == puppet.BlendMode.clipToLower ||
+        mode == puppet.BlendMode.sliceFromLower ||
+        mode == puppet.BlendMode.destinationIn ||
+        mode == puppet.BlendMode.inverse ||
+        mode == puppet.BlendMode.exclusion ||
+        mode == puppet.BlendMode.addGlow) return false;
+    return true;
+  }
+
+  /// Render a textured mesh to a screen-space image without blend mode.
+  ///
+  /// The mesh is drawn with normal blending and full opacity. The PSD shader
+  /// handles blend mode and opacity during compositing.
+  ui.Image? _renderMeshContentToImage(
+      RenderData data, Size size, int w, int h) {
+    final mesh = data.mesh;
+    if (mesh == null) return null;
+    final vertices = data.deformedVertices ?? mesh.vertices;
+    if (vertices.isEmpty) return null;
+
+    // Get texture and atlas UVs
+    ui.Image? texture;
+    List<Vec2>? atlasUvs;
+    if (data.texturedMesh?.albedoTextureId != null) {
+      texture = renderCtx.getTexture(data.texturedMesh!.albedoTextureId!);
+      final atlasRegion =
+          renderCtx.getAtlasRegion(data.texturedMesh!.albedoTextureId!);
+      if (atlasRegion != null && mesh.uvs.isNotEmpty) {
+        atlasUvs =
+            mesh.uvs.map((uv) => atlasRegion.transformUV(uv)).toList();
+      }
+    }
+    if (texture == null) return null;
+
+    final uvs = atlasUvs ?? mesh.uvs;
+
+    // Render to offscreen image with camera + node transform
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    _applyMatrix(canvas,
+        camera.viewProjectionMatrix(size.width, size.height), size);
+    canvas.save();
+    _applyNodeTransform(canvas, data.transform);
+
+    // Use offscreen buffer path to prevent triangle overlap,
+    // with normal blend and full opacity (shader handles these)
+    _drawTexturedMeshWithBlending(
+      canvas,
+      vertices,
+      uvs,
+      mesh.indices,
+      texture,
+      BlendMode.srcOver,
+      1.0,
+    );
+
+    canvas.restore();
+    final picture = recorder.endRecording();
+    final image = picture.toImageSync(w, h);
+    picture.dispose();
+    return image;
+  }
+
+  /// Create a transparent image of the given dimensions.
+  static ui.Image _createTransparentImage(int w, int h) {
+    final recorder = ui.PictureRecorder();
+    Canvas(recorder); // empty canvas → transparent
+    final picture = recorder.endRecording();
+    final image = picture.toImageSync(w, h);
+    picture.dispose();
+    return image;
   }
 
   void _applyMatrix(Canvas canvas, Mat4 matrix, Size size) {
@@ -893,51 +1101,65 @@ class CanvasRenderer {
     );
   }
 
-  /// Convert blend mode to Flutter BlendMode
+  /// Convert puppet blend mode to Flutter BlendMode.
+  ///
+  /// Uses [PsdCanvasCompositor.toFlutterBlendMode] for PSD-compatible modes.
+  /// Inochi2d-specific modes (clipToLower, sliceFromLower, etc.) are mapped
+  /// directly to their Flutter equivalents.
   BlendMode _convertBlendMode(puppet.BlendMode mode) {
     switch (mode) {
-      case puppet.BlendMode.normal:
-        return BlendMode.srcOver;
-      case puppet.BlendMode.multiply:
-        return BlendMode.multiply;
-      case puppet.BlendMode.colorDodge:
-        return BlendMode.colorDodge;
-      case puppet.BlendMode.linearDodge:
-        return BlendMode.plus;
-      case puppet.BlendMode.screen:
-        return BlendMode.screen;
+      // Inochi2d-specific modes (no PSD equivalent)
       case puppet.BlendMode.clipToLower:
-        // srcATop: draws source where destination is opaque, preserving destination color beneath
         return BlendMode.srcATop;
       case puppet.BlendMode.sliceFromLower:
-        // srcOut: draws source where destination is transparent
         return BlendMode.srcOut;
-      case puppet.BlendMode.lighten:
-        return BlendMode.lighten;
       case puppet.BlendMode.addGlow:
         return BlendMode.plus;
-      case puppet.BlendMode.subtract:
-        // Approximation: difference gives a similar visual effect
-        return BlendMode.difference;
-      case puppet.BlendMode.overlay:
-        return BlendMode.overlay;
-      case puppet.BlendMode.darken:
-        return BlendMode.darken;
-      case puppet.BlendMode.difference:
-        return BlendMode.difference;
-      case puppet.BlendMode.exclusion:
-        return BlendMode.exclusion;
-      case puppet.BlendMode.colorBurn:
-        return BlendMode.colorBurn;
-      case puppet.BlendMode.hardLight:
-        return BlendMode.hardLight;
-      case puppet.BlendMode.softLight:
-        return BlendMode.softLight;
       case puppet.BlendMode.inverse:
-        // Approximation: xor provides an inverting effect
         return BlendMode.xor;
       case puppet.BlendMode.destinationIn:
         return BlendMode.dstIn;
+      case puppet.BlendMode.exclusion:
+        return BlendMode.exclusion;
+      // PSD-compatible modes → delegate to dart_psd_tool
+      default:
+        return PsdCanvasCompositor.toFlutterBlendMode(
+          _puppetBlendModeToPsdString(mode),
+        );
+    }
+  }
+
+  /// Convert puppet BlendMode enum to PSD blend mode string.
+  static String _puppetBlendModeToPsdString(puppet.BlendMode mode) {
+    switch (mode) {
+      case puppet.BlendMode.normal:
+        return 'Normal';
+      case puppet.BlendMode.multiply:
+        return 'Multiply';
+      case puppet.BlendMode.screen:
+        return 'Screen';
+      case puppet.BlendMode.overlay:
+        return 'Overlay';
+      case puppet.BlendMode.darken:
+        return 'Darken';
+      case puppet.BlendMode.lighten:
+        return 'Lighten';
+      case puppet.BlendMode.colorDodge:
+        return 'ColorDodge';
+      case puppet.BlendMode.colorBurn:
+        return 'ColorBurn';
+      case puppet.BlendMode.hardLight:
+        return 'HardLight';
+      case puppet.BlendMode.softLight:
+        return 'SoftLight';
+      case puppet.BlendMode.difference:
+        return 'Difference';
+      case puppet.BlendMode.subtract:
+        return 'Subtract';
+      case puppet.BlendMode.linearDodge:
+        return 'LinearDodge';
+      default:
+        return 'Normal';
     }
   }
 }

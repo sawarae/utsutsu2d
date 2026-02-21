@@ -13,6 +13,8 @@ dependencies:
   archive: ^4.0.7
   path: ^1.8.0
   image: ^4.1.0
+  dart_psd_tool:
+    path: ../dart-psd-tool
 
 flutter:
   shaders:

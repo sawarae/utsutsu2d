@@ -19,6 +19,14 @@ class CanvasRenderer {
   /// PSDTool-compatible GPU compositor (null = use Flutter built-in BlendMode)
   PsdCanvasCompositor? psdCompositor;
 
+  /// Device pixel ratio for Retina-aware offscreen buffer sizing.
+  ///
+  /// The PSD compositor creates offscreen images via [toImageSync] which
+  /// don't inherit the canvas DPR transform. Set this to the display's
+  /// device pixel ratio so buffers are created at full resolution.
+  /// Defaults to 1.0 (no scaling).
+  double devicePixelRatio = 1.0;
+
   bool _shaderLoadAttempted = false;
 
   /// When true, draw a wireframe overlay on top of the rendered puppet.
@@ -107,11 +115,14 @@ class CanvasRenderer {
   /// using the PSD fragment shader for exact 3-component alpha blending.
   void _renderWithPsdCompositor(
       Canvas targetCanvas, Size size, Puppet puppet) {
-    final w = size.width.ceil();
-    final h = size.height.ceil();
-    if (w <= 0 || h <= 0) return;
+    final dpr = devicePixelRatio;
+    final pw = (size.width * dpr).ceil();
+    final ph = (size.height * dpr).ceil();
+    if (pw <= 0 || ph <= 0) return;
 
-    // Running destination image (screen space, accumulates composited content)
+    // Running destination image (screen space, accumulates composited content).
+    // All offscreen images are created at pixel dimensions (logical × DPR)
+    // to avoid resolution loss on Retina displays.
     ui.Image? runningDst;
 
     // Batch management: accumulate normal drawables
@@ -122,10 +133,15 @@ class CanvasRenderer {
     void startBatch() {
       batchRec = ui.PictureRecorder();
       batchCvs = Canvas(batchRec!);
+      // Scale to match display pixel density
+      batchCvs!.scale(dpr, dpr);
       // Draw existing content as base so blend modes within the batch
       // interact with all prior content correctly.
       if (runningDst != null) {
+        batchCvs!.save();
+        batchCvs!.scale(1 / dpr, 1 / dpr);
         batchCvs!.drawImage(runningDst!, Offset.zero, Paint());
+        batchCvs!.restore();
       }
       // Apply camera transform for subsequent world-space drawing
       _applyMatrix(batchCvs!,
@@ -150,7 +166,7 @@ class CanvasRenderer {
       }
       if (runningDst != null) batchCvs!.restore(); // saveLayer
       final picture = batchRec!.endRecording();
-      final batchImage = picture.toImageSync(w, h);
+      final batchImage = picture.toImageSync(pw, ph);
       picture.dispose();
       batchRec = null;
       batchCvs = null;
@@ -169,14 +185,14 @@ class CanvasRenderer {
         flushBatch();
 
         // Render mesh content to image (normal blend, full opacity)
-        final srcImage = _renderMeshContentToImage(data, size, w, h);
+        final srcImage = _renderMeshContentToImage(data, size, pw, ph);
         if (srcImage == null) {
           startBatch();
           continue;
         }
 
         // Ensure dst exists
-        runningDst ??= _createTransparentImage(w, h);
+        runningDst ??= _createTransparentImage(pw, ph);
 
         // PSD shader composite
         final compRec = ui.PictureRecorder();
@@ -185,12 +201,12 @@ class CanvasRenderer {
           compCvs,
           srcImage,
           runningDst!,
-          Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+          Rect.fromLTWH(0, 0, pw.toDouble(), ph.toDouble()),
           opacity: data.drawable.opacity,
           blendMode: _puppetBlendModeToPsdString(data.drawable.blendMode),
         );
         final compPicture = compRec.endRecording();
-        final composited = compPicture.toImageSync(w, h);
+        final composited = compPicture.toImageSync(pw, ph);
         compPicture.dispose();
         runningDst!.dispose();
         srcImage.dispose();
@@ -208,9 +224,14 @@ class CanvasRenderer {
     // Flush final batch
     flushBatch();
 
-    // Draw final result to target canvas (screen space)
+    // Draw final result to target canvas (screen space).
+    // Undo the DPR scale on the target canvas so the pixel-sized image
+    // maps 1:1 to actual display pixels.
     if (runningDst != null) {
+      targetCanvas.save();
+      targetCanvas.scale(1 / dpr, 1 / dpr);
       targetCanvas.drawImage(runningDst!, Offset.zero, Paint());
+      targetCanvas.restore();
       runningDst!.dispose();
     }
   }
@@ -237,7 +258,7 @@ class CanvasRenderer {
   /// The mesh is drawn with normal blending and full opacity. The PSD shader
   /// handles blend mode and opacity during compositing.
   ui.Image? _renderMeshContentToImage(
-      RenderData data, Size size, int w, int h) {
+      RenderData data, Size size, int pw, int ph) {
     final mesh = data.mesh;
     if (mesh == null) return null;
     final vertices = data.deformedVertices ?? mesh.vertices;
@@ -259,9 +280,12 @@ class CanvasRenderer {
 
     final uvs = atlasUvs ?? mesh.uvs;
 
-    // Render to offscreen image with camera + node transform
+    // Render to offscreen image with camera + node transform.
+    // Scale by DPR so the image matches pixel dimensions.
+    final dpr = devicePixelRatio;
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
+    canvas.scale(dpr, dpr);
     _applyMatrix(canvas,
         camera.viewProjectionMatrix(size.width, size.height), size);
     canvas.save();
@@ -281,7 +305,7 @@ class CanvasRenderer {
 
     canvas.restore();
     final picture = recorder.endRecording();
-    final image = picture.toImageSync(w, h);
+    final image = picture.toImageSync(pw, ph);
     picture.dispose();
     return image;
   }

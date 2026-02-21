@@ -484,11 +484,13 @@ class _PuppetWidgetState extends State<PuppetWidget>
       );
     }
 
+    final dpr = MediaQuery.devicePixelRatioOf(context);
     return CustomPaint(
       painter: _PuppetPainter(
         renderer: renderer,
         puppet: puppet,
         repaint: widget.controller,
+        devicePixelRatio: dpr,
       ),
       size: Size.infinite,
     );
@@ -525,22 +527,25 @@ class _PuppetWidgetState extends State<PuppetWidget>
 class _PuppetPainter extends CustomPainter {
   final CanvasRenderer renderer;
   final Puppet puppet;
+  final double devicePixelRatio;
 
   _PuppetPainter({
     required this.renderer,
     required this.puppet,
     Listenable? repaint,
+    this.devicePixelRatio = 1.0,
   }) : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {
+    renderer.devicePixelRatio = devicePixelRatio;
     renderer.render(canvas, size, puppet);
   }
 
   @override
   bool shouldRepaint(_PuppetPainter oldDelegate) {
-    // rendererまたはpuppetのインスタンスが変わった場合のみ再描画
-    // アニメーションフレームの更新は、repaint Listenableによって処理される
-    return renderer != oldDelegate.renderer || puppet != oldDelegate.puppet;
+    return renderer != oldDelegate.renderer ||
+        puppet != oldDelegate.puppet ||
+        devicePixelRatio != oldDelegate.devicePixelRatio;
   }
 }

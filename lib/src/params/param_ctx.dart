@@ -40,6 +40,31 @@ class ParamCtx {
     return id != null ? _values[id] : null;
   }
 
+  /// Get parameter value normalized to [-1..1] range by ID.
+  ///
+  /// Maps the param's [min..max] range to [-1..1].
+  /// For 1D parameters (where min==max on an axis), that axis returns 0.
+  /// Returns null if the parameter is not found.
+  Vec2? getNormalized(String paramId) {
+    final value = _values[paramId];
+    if (value == null) return null;
+    for (final param in params) {
+      if (param.id == paramId) {
+        // param.normalize returns [0..1], remap to [-1..1].
+        // For axes with zero range (1D params), normalize returns 0
+        // which maps to -1; override to 0 for those axes.
+        final n = param.normalize(value);
+        final rangeX = param.maxValue.x - param.minValue.x;
+        final rangeY = param.maxValue.y - param.minValue.y;
+        return Vec2(
+          rangeX != 0 ? n.x * 2 - 1 : 0,
+          rangeY != 0 ? n.y * 2 - 1 : 0,
+        );
+      }
+    }
+    return null;
+  }
+
   /// Reset for new frame
   void beginFrame() {
     _appliedThisFrame.clear();

@@ -111,6 +111,11 @@ class SpringPendulum extends Pendulum {
   double _velocityX = 0;
   double _velocityY = 0;
 
+  /// Previous anchor position for tracking anchor movement.
+  /// When the anchor moves, the bob retains its absolute position (inertia),
+  /// creating a relative offset that the spring then resolves.
+  Vec2 _prevAnchor;
+
   SpringPendulum({
     required super.anchor,
     required super.length,
@@ -118,7 +123,7 @@ class SpringPendulum extends Pendulum {
     this.frequencyY = 1.0,
     this.dampingRatioX = 0.5,
     this.dampingRatioY = 0.5,
-  }) {
+  }) : _prevAnchor = anchor {
     _oscillatorX = DampedOscillator(
       frequency: frequencyX,
       dampingRatio: dampingRatioX,
@@ -131,6 +136,14 @@ class SpringPendulum extends Pendulum {
 
   @override
   void tick(double dt, Vec2 gravity) {
+    // Track anchor movement: when anchor moves, the bob stays in place
+    // (inertia), so the offset relative to the new anchor changes.
+    final anchorDx = anchor.x - _prevAnchor.x;
+    final anchorDy = anchor.y - _prevAnchor.y;
+    _offsetX -= anchorDx;
+    _offsetY -= anchorDy;
+    _prevAnchor = anchor;
+
     // Add gravity as external force
     final forceX = gravity.x;
     final forceY = gravity.y;
@@ -196,5 +209,6 @@ class SpringPendulum extends Pendulum {
     _offsetY = 0;
     _velocityX = 0;
     _velocityY = 0;
+    _prevAnchor = anchor;
   }
 }

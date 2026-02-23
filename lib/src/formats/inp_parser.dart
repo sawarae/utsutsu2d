@@ -225,15 +225,37 @@ class InpParser {
         .map((p) => Param.fromJson(p as Map<String, dynamic>))
         .toList();
 
-    // Parse expression presets (can be Map or empty List)
+    // Parse expression presets (can be Map or empty List).
+    // Two formats are supported:
+    //   Old: {"name": {"param1": 0.5, "param2": 1.0}}
+    //   New: {"name": {"name": "Name", "paramValues": {...}, "paramValuesY": {...}}}
     final expressionsRaw = json['expressions'];
     final expressions = <String, Map<String, double>>{};
     if (expressionsRaw is Map<String, dynamic>) {
       for (final entry in expressionsRaw.entries) {
         final values = entry.value as Map<String, dynamic>? ?? {};
-        expressions[entry.key] = values.map(
-          (k, v) => MapEntry(k, (v as num).toDouble()),
-        );
+        if (values.containsKey('paramValues')) {
+          // New format: extract paramValues (and merge paramValuesY if present)
+          final paramValues = values['paramValues'] as Map<String, dynamic>? ?? {};
+          final paramValuesY = values['paramValuesY'] as Map<String, dynamic>? ?? {};
+          final merged = <String, double>{};
+          for (final pv in paramValues.entries) {
+            if (pv.value is num) merged[pv.key] = (pv.value as num).toDouble();
+          }
+          for (final pv in paramValuesY.entries) {
+            if (pv.value is num) merged['${pv.key}_y'] = (pv.value as num).toDouble();
+          }
+          expressions[entry.key] = merged;
+        } else {
+          // Old format: flat map of param name → value (skip non-num values)
+          final result = <String, double>{};
+          for (final kv in values.entries) {
+            if (kv.value is num) {
+              result[kv.key] = (kv.value as num).toDouble();
+            }
+          }
+          expressions[entry.key] = result;
+        }
       }
     }
     // If expressions is a List (empty or otherwise), we ignore it

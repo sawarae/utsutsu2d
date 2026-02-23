@@ -104,7 +104,7 @@ class CanvasRenderer {
   static bool _debugLogged = false;
 
   FilterQuality get _filterQuality =>
-      _inoxLikeNearestSampling ? FilterQuality.none : FilterQuality.high;
+      _inoxLikeNearestSampling ? FilterQuality.none : FilterQuality.low;
 
   void _drawTexturedMesh(Canvas canvas, RenderData data) {
     final mesh = data.mesh;
@@ -273,6 +273,7 @@ class CanvasRenderer {
         final paint = Paint()
           ..blendMode = BlendMode.srcOver
           ..color = Colors.white.withOpacity(data.drawable.opacity)
+          ..isAntiAlias = false
           ..filterQuality = _filterQuality;
         _drawTexturedTriangles(
           canvas,
@@ -348,6 +349,7 @@ class CanvasRenderer {
     // Do NOT apply opacity here - it will be applied at composite time
     final trianglePaint = Paint()
       ..blendMode = BlendMode.srcOver
+      ..isAntiAlias = false
       ..filterQuality = _filterQuality;
 
     _drawTexturedTriangles(
@@ -446,6 +448,7 @@ class CanvasRenderer {
       final texturedPaint = Paint()
         ..blendMode = paint.blendMode
         ..color = paint.color
+        ..isAntiAlias = false
         ..filterQuality = _filterQuality
         ..shader = shader;
 
@@ -781,6 +784,7 @@ class CanvasRenderer {
       // Render the textured mesh with normal blending
       final paint = Paint()
         ..blendMode = BlendMode.srcOver
+        ..isAntiAlias = false
         ..filterQuality = _filterQuality;
       _drawTexturedTriangles(
         offCanvas,

@@ -27,6 +27,7 @@ class CanvasRenderer {
   double devicePixelRatio = 1.0;
 
   bool _shaderLoadAttempted = false;
+  int _debugLoggedDrawableCount = -1;
 
   /// When true, draw a wireframe overlay on top of the rendered puppet.
   bool showMeshOverlay = false;
@@ -48,17 +49,24 @@ class CanvasRenderer {
         'packages/utsutsu2d/lib/src/render/shaders/mask_threshold.frag',
       );
     } catch (e) {
+      debugPrint('[CanvasRenderer] mask shader failed: $e');
       _maskShaderProgram = null;
     }
     try {
       psdCompositor = await PsdCanvasCompositor.create();
     } catch (e) {
+      debugPrint('[CanvasRenderer] PSD compositor failed: $e');
       psdCompositor = null;
     }
+    debugPrint('[CanvasRenderer] loadShaders done: '
+        'mask=${_maskShaderProgram != null}, '
+        'psd=${psdCompositor != null}');
   }
 
   /// Render the puppet to a canvas
   void render(Canvas canvas, Size size, Puppet puppet) {
+    final dpr = devicePixelRatio;
+
     canvas.save();
 
     if (psdCompositor != null) {
@@ -176,6 +184,23 @@ class CanvasRenderer {
 
     startBatch();
 
+    // Debug: log which drawables go through PSD vs batch path (once per model load)
+    if (_debugLoggedDrawableCount != renderCtx.drawables.length) {
+      _debugLoggedDrawableCount = renderCtx.drawables.length;
+      final logBuf = StringBuffer();
+      logBuf.writeln('[PSD] drawables=${renderCtx.drawables.length} psdCompositor=${psdCompositor != null}');
+      for (final d in renderCtx.drawables) {
+        if (renderCtx.isNodeHidden(d.nodeId)) continue;
+        final psd = _needsPsdShaderPath(d);
+        final mask = d.drawable.hasMasks;
+        final mode = d.drawable.blendMode;
+        if (psd || mask || mode.index != 0) {
+          logBuf.writeln('[PSD] node=${d.nodeId} kind=${d.kind} psd=$psd mask=$mask mode=$mode');
+        }
+      }
+      debugPrint(logBuf.toString());
+    }
+
     for (final data in renderCtx.drawables) {
       if (renderCtx.isNodeHidden(data.nodeId)) continue;
 
@@ -184,10 +209,33 @@ class CanvasRenderer {
         flushBatch();
 
         // Render mesh content to image (normal blend, full opacity)
-        final srcImage = _renderMeshContentToImage(data, size, pw, ph);
+        var srcImage = _renderMeshContentToImage(data, size, pw, ph);
         if (srcImage == null) {
           startBatch();
           continue;
+        }
+
+        // For masked drawables: apply mask to content before PSD compositing.
+        // Renders mask at the same screen-space coordinates as the content
+        // to ensure pixel-perfect alignment.
+        if (data.drawable.hasMasks) {
+          final maskImage = _renderMaskToScreenImage(data, size, pw, ph);
+          if (maskImage != null) {
+            final maskedRec = ui.PictureRecorder();
+            final maskedCvs = Canvas(maskedRec);
+            maskedCvs.drawImage(srcImage, Offset.zero, Paint());
+            maskedCvs.drawImage(
+              maskImage,
+              Offset.zero,
+              Paint()..blendMode = BlendMode.dstIn,
+            );
+            final maskedPicture = maskedRec.endRecording();
+            final maskedImage = maskedPicture.toImageSync(pw, ph);
+            maskedPicture.dispose();
+            srcImage.dispose();
+            maskImage.dispose();
+            srcImage = maskedImage;
+          }
         }
 
         // Ensure dst exists
@@ -203,6 +251,7 @@ class CanvasRenderer {
           Rect.fromLTWH(0, 0, pw.toDouble(), ph.toDouble()),
           opacity: data.drawable.opacity,
           blendMode: _puppetBlendModeToPsdString(data.drawable.blendMode),
+          srcStraightAlpha: true,
         );
         final compPicture = compRec.endRecording();
         final composited = compPicture.toImageSync(pw, ph);
@@ -236,10 +285,13 @@ class CanvasRenderer {
   }
 
   /// Whether this drawable should use the PSD shader compositing path.
+  ///
+  /// Masked drawables with non-normal blend modes (e.g. multiply shadows)
+  /// are routed through the PSD shader to avoid premultiplied-alpha dark
+  /// fringe artifacts that occur with Flutter's saveLayer compositing.
   bool _needsPsdShaderPath(RenderData data) {
     if (psdCompositor == null) return false;
     if (data.kind != DrawableKind.texturedMesh) return false;
-    if (data.drawable.hasMasks) return false;
     final mode = data.drawable.blendMode;
     if (mode == puppet.BlendMode.normal) return false;
     // Inochi2d-specific modes without PSD equivalent — use Flutter built-in
@@ -307,6 +359,107 @@ class CanvasRenderer {
     final image = picture.toImageSync(pw, ph);
     picture.dispose();
     return image;
+  }
+
+  /// Render mask sources to a screen-space image matching [_renderMeshContentToImage].
+  ///
+  /// Uses the same DPR scaling, camera transform, and pixel dimensions so the
+  /// mask aligns pixel-for-pixel with the content image. The mask is
+  /// thresholded to binary alpha (opaque/transparent) using the drawable's
+  /// maskThreshold. Multiple mask sources are intersected.
+  ui.Image? _renderMaskToScreenImage(
+      RenderData data, Size size, int pw, int ph) {
+    final masks = data.drawable.masks;
+    if (masks == null || masks.isEmpty) return null;
+
+    final threshold = data.drawable.maskThreshold ?? 0.0;
+    final dpr = devicePixelRatio;
+    final viewProjection = camera.viewProjectionMatrix(size.width, size.height);
+
+    ui.Image? combinedMask;
+
+    for (final mask in masks) {
+      final sourceData = renderCtx.getRenderData(mask.sourceNodeId);
+      if (sourceData == null || sourceData.mesh == null) continue;
+
+      final sourceVertices =
+          sourceData.deformedVertices ?? sourceData.mesh!.vertices;
+      if (sourceVertices.isEmpty) continue;
+
+      // Get mask source texture and UVs
+      ui.Image? sourceTexture;
+      List<Vec2>? sourceAtlasUvs;
+      if (sourceData.texturedMesh?.albedoTextureId != null) {
+        sourceTexture =
+            renderCtx.getTexture(sourceData.texturedMesh!.albedoTextureId!);
+        final atlasRegion = renderCtx
+            .getAtlasRegion(sourceData.texturedMesh!.albedoTextureId!);
+        if (atlasRegion != null && sourceData.mesh!.uvs.isNotEmpty) {
+          sourceAtlasUvs = sourceData.mesh!.uvs
+              .map((uv) => atlasRegion.transformUV(uv))
+              .toList();
+        }
+      }
+      if (sourceTexture == null) continue;
+
+      final uvs = sourceAtlasUvs ?? sourceData.mesh!.uvs;
+
+      // Render mask source at screen space (same transforms as content)
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      canvas.scale(dpr, dpr);
+      _applyMatrix(canvas, viewProjection, size);
+      canvas.save();
+      _applyNodeTransform(canvas, sourceData.transform);
+
+      final paint = Paint()
+        ..blendMode = BlendMode.srcOver
+        ..filterQuality = FilterQuality.high;
+      _drawTexturedTriangles(
+        canvas,
+        sourceVertices,
+        uvs,
+        sourceData.mesh!.indices,
+        sourceTexture,
+        paint,
+      );
+
+      canvas.restore();
+      final picture = recorder.endRecording();
+      final rawMask = picture.toImageSync(pw, ph);
+      picture.dispose();
+
+      // Apply binary threshold
+      final thresholded = _applyThresholdToImage(
+        rawMask,
+        threshold,
+        pw,
+        ph,
+        invert: mask.mode == puppet.MaskMode.dodge,
+      );
+      rawMask.dispose();
+
+      if (combinedMask == null) {
+        combinedMask = thresholded;
+      } else {
+        // Intersect: keep only where both masks are opaque (dstIn)
+        final combRec = ui.PictureRecorder();
+        final combCvs = Canvas(combRec);
+        combCvs.drawImage(combinedMask, Offset.zero, Paint());
+        combCvs.drawImage(
+          thresholded,
+          Offset.zero,
+          Paint()..blendMode = BlendMode.dstIn,
+        );
+        final combPicture = combRec.endRecording();
+        combinedMask.dispose();
+        thresholded.dispose();
+        combinedMask = combPicture.toImageSync(pw, ph);
+        combPicture.dispose();
+      }
+    }
+
+    return combinedMask;
   }
 
   /// Create a transparent image of the given dimensions.
@@ -404,45 +557,99 @@ class CanvasRenderer {
       final height = combinedBounds.height.ceil();
       if (width <= 0 || height <= 0) return;
 
-      // 2. Render combined mask image offscreen
-      final maskImage = _renderMaskImage(
-        data.drawable.masks!,
-        data.drawable.maskThreshold ?? 0.0,
-        combinedBounds,
-      );
-      if (maskImage == null) {
-        // No valid mask sources — draw content without masking
-        _drawTexturedMeshContent(canvas, data, vertices, texture, atlasUvs, blendMode);
-        return;
-      }
+      // 2. Apply mask via clipPath (stencil-like), then draw content.
+      //    This matches inox2d's OpenGL stencil buffer approach where
+      //    the mask creates a binary clip region. Unlike the dstIn saveLayer
+      //    approach, clipPath with doAntiAlias:false creates hard pixel
+      //    boundaries with no semi-transparent blending at the edge.
+      //
+      //    For dodge mode, we fall back to the offscreen mask approach since
+      //    clipPath can't express "visible where mask is NOT."
 
-      // 3. Render the drawable content to a saveLayer, then apply mask via dstIn
-      canvas.save();
-      final layerPaint = Paint()..blendMode = blendMode;
-      canvas.saveLayer(combinedBounds, layerPaint);
+      final threshold = data.drawable.maskThreshold ?? 0.0;
+      final hasDodgeMask = data.drawable.masks!.any(
+          (m) => m.mode == puppet.MaskMode.dodge);
 
-      // Draw the actual content
-      canvas.save();
-      _applyNodeTransform(canvas, data.transform);
-      if (texture != null) {
-        final uvs = atlasUvs ?? mesh.uvs;
-        _drawTexturedMeshWithBlending(
-          canvas, vertices, uvs, mesh.indices, texture,
-          BlendMode.srcOver, data.drawable.opacity,
+      if (!hasDodgeMask) {
+        // Standard mask with dstIn
+        final maskImage = _renderMaskImage(
+          data.drawable.masks!,
+          threshold,
+          combinedBounds,
         );
+
+        if (maskImage != null) {
+          canvas.save();
+          final layerPaint = Paint()..blendMode = blendMode;
+          canvas.saveLayer(combinedBounds, layerPaint);
+
+          // Draw content using offscreen buffer (prevents triangle overlap)
+          canvas.save();
+          _applyNodeTransform(canvas, data.transform);
+          if (texture != null) {
+            final uvs = atlasUvs ?? mesh.uvs;
+            _drawTexturedMeshWithBlending(
+              canvas, vertices, uvs, mesh.indices, texture,
+              BlendMode.srcOver, data.drawable.opacity,
+            );
+          }
+          canvas.restore();
+
+          // Apply mask: keep content only where mask alpha > 0
+          canvas.drawImageRect(
+            maskImage,
+            Rect.fromLTWH(0, 0, maskImage.width.toDouble(), maskImage.height.toDouble()),
+            combinedBounds,
+            Paint()..blendMode = BlendMode.dstIn,
+          );
+
+          canvas.restore(); // saveLayer
+          canvas.restore();
+          maskImage.dispose();
+        } else {
+          _drawTexturedMeshContent(
+              canvas, data, vertices, texture, atlasUvs, blendMode);
+        }
+      } else {
+        // Dodge mask: fall back to offscreen mask image + dstOut
+        final maskImage = _renderMaskImage(
+          data.drawable.masks!,
+          threshold,
+          combinedBounds,
+        );
+        if (maskImage == null) {
+          _drawTexturedMeshContent(
+              canvas, data, vertices, texture, atlasUvs, blendMode);
+          return;
+        }
+
+        canvas.save();
+        final layerPaint = Paint()..blendMode = blendMode;
+        canvas.saveLayer(combinedBounds, layerPaint);
+
+        canvas.save();
+        _applyNodeTransform(canvas, data.transform);
+        if (texture != null) {
+          final uvs = atlasUvs ?? mesh.uvs;
+          _drawTexturedMeshWithBlending(
+            canvas, vertices, uvs, mesh.indices, texture,
+            BlendMode.srcOver, data.drawable.opacity,
+          );
+        }
+        canvas.restore();
+
+        canvas.drawImageRect(
+          maskImage,
+          Rect.fromLTWH(
+              0, 0, maskImage.width.toDouble(), maskImage.height.toDouble()),
+          combinedBounds,
+          Paint()..blendMode = BlendMode.dstOut,
+        );
+        canvas.restore(); // saveLayer
+        canvas.restore(); // save
+
+        maskImage.dispose();
       }
-      canvas.restore();
-
-      // 4. Apply mask using dstIn (keeps content only where mask is opaque)
-      canvas.drawImage(
-        maskImage,
-        Offset(combinedBounds.left, combinedBounds.top),
-        Paint()..blendMode = BlendMode.dstIn,
-      );
-      canvas.restore(); // restore saveLayer
-      canvas.restore(); // restore save
-
-      maskImage.dispose();
     } else {
       _drawTexturedMeshContent(canvas, data, vertices, texture, atlasUvs, blendMode);
     }
@@ -601,8 +808,9 @@ class CanvasRenderer {
     List<Vec2> uvs,
     List<int> indices,
     ui.Image texture,
-    Paint paint,
-  ) {
+    Paint paint, {
+    bool antiAlias = true,
+  }) {
     if (indices.length < 3) return;
 
     // Vertices.raw requires Uint16List indices (max vertex index 65535).
@@ -663,7 +871,8 @@ class CanvasRenderer {
 
     final drawPaint = Paint()
       ..shader = shader
-      ..blendMode = paint.blendMode;
+      ..blendMode = paint.blendMode
+      ..isAntiAlias = antiAlias;
 
     canvas.drawVertices(verts, vertexBlendMode, drawPaint);
 
@@ -831,8 +1040,13 @@ class CanvasRenderer {
     double threshold,
     Rect bounds,
   ) {
-    final width = bounds.width.ceil();
-    final height = bounds.height.ceil();
+    // Render at screen resolution when camera zoom info is available.
+    // This prevents bilinear interpolation artifacts at mask edges when
+    // the mask image is scaled by the camera zoom on the canvas.
+    final dpr = devicePixelRatio;
+    final scale = (camera.zoom * dpr).clamp(0.5, 8.0);
+    final width = (bounds.width * scale).ceil();
+    final height = (bounds.height * scale).ceil();
     if (width <= 0 || height <= 0) return null;
 
     // Render each mask source and combine them via intersection
@@ -864,11 +1078,12 @@ class CanvasRenderer {
 
       final uvs = sourceAtlasUvs ?? sourceData.mesh!.uvs;
 
-      // Render mask source to offscreen canvas
+      // Render mask source to offscreen canvas at screen resolution
       final recorder = ui.PictureRecorder();
       final offCanvas = Canvas(recorder);
 
-      // Translate so that bounds.topLeft maps to (0,0)
+      // Scale to screen resolution, then translate bounds.topLeft to (0,0)
+      offCanvas.scale(scale, scale);
       offCanvas.translate(-bounds.left, -bounds.top);
 
       // Apply mask source's node transform
@@ -1128,4 +1343,5 @@ class CanvasRenderer {
         return 'Normal';
     }
   }
+
 }

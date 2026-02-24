@@ -15,11 +15,11 @@ void main() {
     float alpha = color.a;
     alpha = mix(alpha, 1.0 - alpha, invert);  // dodge mode
 
-    // Keep soft mask edges and only suppress values below threshold.
-    // This matches the CPU/color-filter path:
-    //   out = clamp((alpha - threshold) / (1 - threshold), 0, 1)
+    // Use a step-function threshold to suppress very thin, low-alpha artifacts
+    // (e.g., nose-top faint shadow), aligning with Ubuntu-tested results.
+    // Equivalent to: mask = alpha > t ? 1.0 : 0.0
     float t = clamp(threshold, 0.0, 0.9999);
-    float mask = clamp((alpha - t) / (1.0 - t), 0.0, 1.0);
+    float mask = alpha > t ? 1.0 : 0.0;
 
     fragColor = vec4(1.0, 1.0, 1.0, mask);
 }

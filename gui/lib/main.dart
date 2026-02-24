@@ -52,10 +52,12 @@ Uint8List _decodeTgaToPng(Uint8List data) {
   decodedImage ??= img.decodeImage(data);
   if (decodedImage == null) return Uint8List(0);
   _unpremultiplyAlpha(decodedImage);
+  _clearOuterBorderAlpha(decodedImage, borderPixels: 1);
   if (!_disableTextureBleed) {
     _bleedTransparentPixels(decodedImage);
     _normalizeLowAlphaEdgeColors(decodedImage);
   }
+  _stripTinyAlphaNoise(decodedImage);
   return Uint8List.fromList(img.encodePng(decodedImage));
 }
 
@@ -71,6 +73,35 @@ void _unpremultiplyAlpha(img.Image image) {
       final g = (p.g * 255.0 / a).round().clamp(0, 255);
       final b = (p.b * 255.0 / a).round().clamp(0, 255);
       image.setPixelRgba(x, y, r, g, b, a);
+    }
+  }
+}
+
+void _stripTinyAlphaNoise(img.Image image, {int alphaCutoff = 2}) {
+  if (alphaCutoff <= 0) return;
+  final w = image.width;
+  final h = image.height;
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      final p = image.getPixel(x, y);
+      final a = p.a.toInt();
+      if (a > 0 && a <= alphaCutoff) {
+        image.setPixelRgba(x, y, 0, 0, 0, 0);
+      }
+    }
+  }
+}
+
+void _clearOuterBorderAlpha(img.Image image, {int borderPixels = 1}) {
+  if (borderPixels <= 0) return;
+  final w = image.width;
+  final h = image.height;
+  final b = borderPixels;
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      if (x < b || y < b || x >= w - b || y >= h - b) {
+        image.setPixelRgba(x, y, 0, 0, 0, 0);
+      }
     }
   }
 }

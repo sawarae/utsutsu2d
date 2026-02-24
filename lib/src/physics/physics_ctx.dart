@@ -77,39 +77,69 @@ class PhysicsCtx {
       throw ArgumentError('Delta time cannot be negative');
     }
 
+    // Always update anchors from input parameters, even when dt=0.
+    // This ensures physics state stays in sync with programmatic
+    // parameter changes (e.g., MCP set_param).
+    _updateAnchorsFromInputParams(paramCtx);
+
     // Clamp frame time
     dt = math.min(dt, _maxFrameTime);
     _elapsedTime += dt;
 
     // Fixed timestep integration
     while (dt >= _timestep) {
-      _tick(_timestep, paramCtx);
+      _tick(_timestep);
       dt -= _timestep;
     }
 
     // Handle remaining time
     if (dt > 0) {
-      _tick(dt, paramCtx);
+      _tick(dt);
+    }
+
+    // Always write output params (even at dt=0) so the pendulum's
+    // current position is reflected in the parameter values.
+    _writeOutputParams(paramCtx);
+  }
+
+  /// Read input parameters and update pendulum anchors.
+  void _updateAnchorsFromInputParams(ParamCtx? paramCtx) {
+    if (paramCtx == null) return;
+    for (final state in _states) {
+      final config = state.config;
+      if (config.inputParamId == null) continue;
+
+      // Get normalized [-1..1] value regardless of the param's native range.
+      final normalized = paramCtx.getNormalized(config.inputParamId!);
+      if (normalized == null) continue;
+
+      // Displace anchor by normalized input scaled by pendulum length.
+      state.pendulum.anchor = Vec2(
+        normalized.x * config.length,
+        normalized.y * config.length,
+      );
     }
   }
 
-  void _tick(double dt, ParamCtx? paramCtx) {
+  /// Write pendulum output to mapped parameters.
+  void _writeOutputParams(ParamCtx? paramCtx) {
+    if (paramCtx == null) return;
     for (final state in _states) {
       final config = state.config;
+      if (config.mapParamId == null) continue;
 
-      // Determine gravity
       final gravity = config.localGravity ?? globalPhysics.gravity;
+      final output = state.pendulum.calcOutput(gravity);
+      final scaled = output * config.outputScale;
+      paramCtx.setValue(config.mapParamId!, scaled);
+    }
+  }
 
-      // Update pendulum
+  void _tick(double dt) {
+    for (final state in _states) {
+      final config = state.config;
+      final gravity = config.localGravity ?? globalPhysics.gravity;
       state.pendulum.tick(dt, gravity);
-
-      // Map output to parameter
-      if (config.mapParamId != null && paramCtx != null) {
-        final output = state.pendulum.calcOutput(gravity);
-        final scaled = output * config.outputScale;
-
-        paramCtx.setValue(config.mapParamId!, scaled);
-      }
     }
   }
 

@@ -23,34 +23,63 @@ class ParameterSlider extends StatelessWidget {
       builder: (context, child) {
         final value = controller.puppet?.getParamValue(param.name);
         final currentX = value?.x ?? param.defaultValue.x;
+        final min = param.minValue.x;
+        final max = param.maxValue.x;
+        final clamped = currentX.clamp(min, max);
+
+        // Snap to integers when min and max are both integers
+        final isIntParam = min == min.roundToDouble() &&
+            max == max.roundToDouble() &&
+            max > min;
+        final divisions = isIntParam ? (max - min).round() : null;
+
+        final valueLabel = isIntParam
+            ? clamped.round().toString()
+            : clamped.toStringAsFixed(2);
+
+        final smallStyle = Theme.of(context).textTheme.bodySmall;
 
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(
-              label ?? param.name,
-              style: Theme.of(context).textTheme.bodySmall,
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label ?? param.name,
+                    style: smallStyle,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Text(
+                  valueLabel,
+                  style: smallStyle?.copyWith(
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ],
             ),
             Row(
               children: [
                 Text(
-                  param.minValue.x.toStringAsFixed(1),
-                  style: Theme.of(context).textTheme.bodySmall,
+                  isIntParam ? min.round().toString() : min.toStringAsFixed(1),
+                  style: smallStyle,
                 ),
                 Expanded(
                   child: Slider(
-                    value: currentX.clamp(param.minValue.x, param.maxValue.x),
-                    min: param.minValue.x,
-                    max: param.maxValue.x,
+                    value: clamped,
+                    min: min,
+                    max: max,
+                    divisions: divisions,
                     onChanged: (value) {
                       controller.setParameter(param.name, value);
                     },
                   ),
                 ),
                 Text(
-                  param.maxValue.x.toStringAsFixed(1),
-                  style: Theme.of(context).textTheme.bodySmall,
+                  isIntParam ? max.round().toString() : max.toStringAsFixed(1),
+                  style: smallStyle,
                 ),
               ],
             ),
@@ -86,7 +115,8 @@ class _Parameter2DPadState extends State<Parameter2DPad> {
     return ListenableBuilder(
       listenable: widget.controller,
       builder: (context, child) {
-        final value = widget.controller.puppet?.getParamValue(widget.param.name);
+        final value =
+            widget.controller.puppet?.getParamValue(widget.param.name);
         final currentValue = value ?? widget.param.defaultValue;
 
         // Normalize to 0-1 range
@@ -149,10 +179,10 @@ class _Parameter2DPadState extends State<Parameter2DPad> {
     final normalizedY = (position.dy / widget.size).clamp(0.0, 1.0);
 
     // Convert to parameter value
-    final valueX = param.minValue.x +
-        normalizedX * (param.maxValue.x - param.minValue.x);
-    final valueY = param.minValue.y +
-        normalizedY * (param.maxValue.y - param.minValue.y);
+    final valueX =
+        param.minValue.x + normalizedX * (param.maxValue.x - param.minValue.x);
+    final valueY =
+        param.minValue.y + normalizedY * (param.maxValue.y - param.minValue.y);
 
     widget.controller.setParameter(param.name, valueX, valueY);
   }

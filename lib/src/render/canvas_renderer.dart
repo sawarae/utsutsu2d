@@ -1,18 +1,11 @@
-import 'dart:math' show sqrt;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:dart_psd_tool/dart_psd_tool.dart';
 import 'package:flutter/material.dart';
 import '../core/core.dart';
 import '../math/math.dart';
 import '../components/drawable.dart' as puppet;
 import 'render_ctx.dart';
-
-const bool _inoxLikeNoClipExpand =
-    bool.fromEnvironment('INOX_LIKE_NO_CLIP_EXPAND');
-const bool _inoxLikeNearestSampling =
-    bool.fromEnvironment('INOX_LIKE_NEAREST_SAMPLING');
-const bool _useLegacyTriangleClip =
-    bool.fromEnvironment('USE_LEGACY_TRIANGLE_CLIP');
 
 /// Canvas-based renderer for puppets
 class CanvasRenderer {
@@ -21,7 +14,22 @@ class CanvasRenderer {
 
   /// GPU fragment shader for mask thresholding (null = use ColorFilter fallback)
   ui.FragmentProgram? _maskShaderProgram;
+
+  /// PSDTool-compatible GPU compositor (null = use Flutter built-in BlendMode)
+  PsdCanvasCompositor? psdCompositor;
+
+  /// Device pixel ratio for Retina-aware offscreen buffer sizing.
+  ///
+  /// The PSD compositor creates offscreen images via [toImageSync] which
+  /// don't inherit the canvas DPR transform. Set this to the display's
+  /// device pixel ratio so buffers are created at full resolution.
+  /// Defaults to 1.0 (no scaling).
+  double devicePixelRatio = 1.0;
+
   bool _shaderLoadAttempted = false;
+
+  /// When true, draw a wireframe overlay on top of the rendered puppet.
+  bool showMeshOverlay = false;
 
   CanvasRenderer({
     required this.renderCtx,
@@ -39,11 +47,13 @@ class CanvasRenderer {
       _maskShaderProgram = await ui.FragmentProgram.fromAsset(
         'packages/utsutsu2d/lib/src/render/shaders/mask_threshold.frag',
       );
-      print('[CanvasRenderer] GPU mask threshold shader loaded');
     } catch (e) {
-      print(
-          '[CanvasRenderer] Shader load failed, using ColorFilter fallback: $e');
       _maskShaderProgram = null;
+    }
+    try {
+      psdCompositor = await PsdCanvasCompositor.create();
+    } catch (e) {
+      psdCompositor = null;
     }
   }
 
@@ -51,14 +61,260 @@ class CanvasRenderer {
   void render(Canvas canvas, Size size, Puppet puppet) {
     canvas.save();
 
-    // Apply camera transform
-    final viewProjection = camera.viewProjectionMatrix(size.width, size.height);
-    _applyMatrix(canvas, viewProjection, size);
+    if (psdCompositor != null) {
+      // PSD-accurate compositing: running buffer with shader blending.
+      // Camera transform is applied internally per-picture.
+      _renderWithPsdCompositor(canvas, size, puppet);
+    } else {
+      // Fast path: Flutter built-in blend modes (approximate).
+      final viewProjection =
+          camera.viewProjectionMatrix(size.width, size.height);
+      _applyMatrix(canvas, viewProjection, size);
 
-    // Draw all drawables
-    _drawAllDrawables(canvas, puppet);
+      // Isolate puppet rendering in a transparent compositing layer.
+      // Without this, drawables with multiply (or other) blend modes that
+      // are not inside a Composite node blend directly against the canvas
+      // background (e.g. gray), producing incorrect colors (Issue #4).
+      canvas.saveLayer(null, Paint());
+      _drawAllDrawables(canvas, puppet);
+      canvas.restore();
+    }
 
     canvas.restore();
+
+    if (showMeshOverlay) {
+      _drawMeshOverlayPass(canvas, size);
+    }
+  }
+
+  /// Draw wireframe overlay for all visible drawables.
+  void _drawMeshOverlayPass(Canvas canvas, Size size) {
+    canvas.save();
+    _applyMatrix(
+        canvas, camera.viewProjectionMatrix(size.width, size.height), size);
+    for (final data in renderCtx.drawables) {
+      if (renderCtx.isNodeHidden(data.nodeId)) continue;
+      final mesh = data.mesh;
+      if (mesh == null) continue;
+      final vertices = data.deformedVertices ?? mesh.vertices;
+      if (vertices.isEmpty) continue;
+      canvas.save();
+      _applyNodeTransform(canvas, data.transform);
+      _drawWireframe(canvas, vertices, mesh.indices);
+      canvas.restore();
+    }
+    canvas.restore();
+  }
+
+  /// PSD-accurate rendering using a running buffer and shader compositing.
+  ///
+  /// Maintains a screen-space image buffer. Normal-blend drawables are
+  /// accumulated in a batch (PictureRecorder). When a non-normal textured
+  /// mesh is encountered, the batch is flushed and the mesh is composited
+  /// using the PSD fragment shader for exact 3-component alpha blending.
+  void _renderWithPsdCompositor(Canvas targetCanvas, Size size, Puppet puppet) {
+    final dpr = devicePixelRatio;
+    final pw = (size.width * dpr).ceil();
+    final ph = (size.height * dpr).ceil();
+    if (pw <= 0 || ph <= 0) return;
+
+    // Running destination image (screen space, accumulates composited content).
+    // All offscreen images are created at pixel dimensions (logical × DPR)
+    // to avoid resolution loss on Retina displays.
+    ui.Image? runningDst;
+
+    // Batch management: accumulate normal drawables
+    ui.PictureRecorder? batchRec;
+    Canvas? batchCvs;
+    bool batchDirty = false;
+
+    void startBatch() {
+      batchRec = ui.PictureRecorder();
+      batchCvs = Canvas(batchRec!);
+      // Scale to match display pixel density
+      batchCvs!.scale(dpr, dpr);
+      // Draw existing content as base so blend modes within the batch
+      // interact with all prior content correctly.
+      if (runningDst != null) {
+        batchCvs!.save();
+        batchCvs!.scale(1 / dpr, 1 / dpr);
+        batchCvs!.drawImage(runningDst!, Offset.zero, Paint());
+        batchCvs!.restore();
+      }
+      // Apply camera transform for subsequent world-space drawing
+      _applyMatrix(batchCvs!,
+          camera.viewProjectionMatrix(size.width, size.height), size);
+      // Isolate new drawing in a saveLayer (same as fast path) so blend
+      // modes don't interact with the runningDst base image directly.
+      if (runningDst != null) {
+        batchCvs!.saveLayer(null, Paint());
+      }
+      batchDirty = false;
+    }
+
+    void flushBatch() {
+      if (batchRec == null) return;
+      if (!batchDirty && runningDst != null) {
+        // Nothing new was drawn; discard recorder
+        if (runningDst != null) batchCvs!.restore(); // saveLayer
+        batchRec!.endRecording().dispose();
+        batchRec = null;
+        batchCvs = null;
+        return;
+      }
+      if (runningDst != null) batchCvs!.restore(); // saveLayer
+      final picture = batchRec!.endRecording();
+      final batchImage = picture.toImageSync(pw, ph);
+      picture.dispose();
+      batchRec = null;
+      batchCvs = null;
+      // The batch already includes runningDst as base → replace
+      runningDst?.dispose();
+      runningDst = batchImage;
+    }
+
+    startBatch();
+
+    for (final data in renderCtx.drawables) {
+      if (renderCtx.isNodeHidden(data.nodeId)) continue;
+
+      if (_needsPsdShaderPath(data)) {
+        // Flush any accumulated normal drawables
+        flushBatch();
+
+        // Render mesh content to image (normal blend, full opacity)
+        final srcImage = _renderMeshContentToImage(data, size, pw, ph);
+        if (srcImage == null) {
+          startBatch();
+          continue;
+        }
+
+        // Ensure dst exists
+        runningDst ??= _createTransparentImage(pw, ph);
+
+        // PSD shader composite
+        final compRec = ui.PictureRecorder();
+        final compCvs = Canvas(compRec);
+        psdCompositor!.composite(
+          compCvs,
+          srcImage,
+          runningDst!,
+          Rect.fromLTWH(0, 0, pw.toDouble(), ph.toDouble()),
+          opacity: data.drawable.opacity,
+          blendMode: _puppetBlendModeToPsdString(data.drawable.blendMode),
+        );
+        final compPicture = compRec.endRecording();
+        final composited = compPicture.toImageSync(pw, ph);
+        compPicture.dispose();
+        runningDst!.dispose();
+        srcImage.dispose();
+        runningDst = composited;
+
+        // Start new batch (with updated runningDst as base)
+        startBatch();
+      } else {
+        // Normal path: draw to batch
+        _drawRenderable(batchCvs!, data, puppet);
+        batchDirty = true;
+      }
+    }
+
+    // Flush final batch
+    flushBatch();
+
+    // Draw final result to target canvas (screen space).
+    // Undo the DPR scale on the target canvas so the pixel-sized image
+    // maps 1:1 to actual display pixels.
+    if (runningDst != null) {
+      targetCanvas.save();
+      targetCanvas.scale(1 / dpr, 1 / dpr);
+      targetCanvas.drawImage(runningDst!, Offset.zero, Paint());
+      targetCanvas.restore();
+      runningDst!.dispose();
+    }
+  }
+
+  /// Whether this drawable should use the PSD shader compositing path.
+  bool _needsPsdShaderPath(RenderData data) {
+    if (psdCompositor == null) return false;
+    if (data.kind != DrawableKind.texturedMesh) return false;
+    if (data.drawable.hasMasks) return false;
+    final mode = data.drawable.blendMode;
+    if (mode == puppet.BlendMode.normal) return false;
+    // Inochi2d-specific modes without PSD equivalent — use Flutter built-in
+    if (mode == puppet.BlendMode.clipToLower ||
+        mode == puppet.BlendMode.sliceFromLower ||
+        mode == puppet.BlendMode.destinationIn ||
+        mode == puppet.BlendMode.inverse ||
+        mode == puppet.BlendMode.exclusion ||
+        mode == puppet.BlendMode.addGlow) return false;
+    return true;
+  }
+
+  /// Render a textured mesh to a screen-space image without blend mode.
+  ///
+  /// The mesh is drawn with normal blending and full opacity. The PSD shader
+  /// handles blend mode and opacity during compositing.
+  ui.Image? _renderMeshContentToImage(
+      RenderData data, Size size, int pw, int ph) {
+    final mesh = data.mesh;
+    if (mesh == null) return null;
+    final vertices = data.deformedVertices ?? mesh.vertices;
+    if (vertices.isEmpty) return null;
+
+    // Get texture and atlas UVs
+    ui.Image? texture;
+    List<Vec2>? atlasUvs;
+    if (data.texturedMesh?.albedoTextureId != null) {
+      texture = renderCtx.getTexture(data.texturedMesh!.albedoTextureId!);
+      final atlasRegion =
+          renderCtx.getAtlasRegion(data.texturedMesh!.albedoTextureId!);
+      if (atlasRegion != null && mesh.uvs.isNotEmpty) {
+        atlasUvs = mesh.uvs.map((uv) => atlasRegion.transformUV(uv)).toList();
+      }
+    }
+    if (texture == null) return null;
+
+    final uvs = atlasUvs ?? mesh.uvs;
+
+    // Render to offscreen image with camera + node transform.
+    // Scale by DPR so the image matches pixel dimensions.
+    final dpr = devicePixelRatio;
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    canvas.scale(dpr, dpr);
+    _applyMatrix(
+        canvas, camera.viewProjectionMatrix(size.width, size.height), size);
+    canvas.save();
+    _applyNodeTransform(canvas, data.transform);
+
+    // Use offscreen buffer path to prevent triangle overlap,
+    // with normal blend and full opacity (shader handles these)
+    _drawTexturedMeshWithBlending(
+      canvas,
+      vertices,
+      uvs,
+      mesh.indices,
+      texture,
+      BlendMode.srcOver,
+      1.0,
+    );
+
+    canvas.restore();
+    final picture = recorder.endRecording();
+    final image = picture.toImageSync(pw, ph);
+    picture.dispose();
+    return image;
+  }
+
+  /// Create a transparent image of the given dimensions.
+  static ui.Image _createTransparentImage(int w, int h) {
+    final recorder = ui.PictureRecorder();
+    Canvas(recorder); // empty canvas → transparent
+    final picture = recorder.endRecording();
+    final image = picture.toImageSync(w, h);
+    picture.dispose();
+    return image;
   }
 
   void _applyMatrix(Canvas canvas, Mat4 matrix, Size size) {
@@ -99,26 +355,13 @@ class CanvasRenderer {
     }
   }
 
-  // Debug counter for logging
-  static int _debugDrawCount = 0;
-  static bool _debugLogged = false;
-
-  FilterQuality get _filterQuality =>
-      _inoxLikeNearestSampling ? FilterQuality.none : FilterQuality.low;
-
   void _drawTexturedMesh(Canvas canvas, RenderData data) {
     final mesh = data.mesh;
     final texturedMesh = data.texturedMesh;
-    if (mesh == null) {
-      if (!_debugLogged) print('[Render] mesh is null');
-      return;
-    }
+    if (mesh == null) return;
 
     final vertices = data.deformedVertices ?? mesh.vertices;
-    if (vertices.isEmpty) {
-      if (!_debugLogged) print('[Render] vertices is empty');
-      return;
-    }
+    if (vertices.isEmpty) return;
 
     // Get texture and atlas region if available
     ui.Image? texture;
@@ -132,13 +375,6 @@ class CanvasRenderer {
       if (atlasRegion != null && mesh.uvs.isNotEmpty) {
         atlasUvs = mesh.uvs.map((uv) => atlasRegion.transformUV(uv)).toList();
       }
-    }
-
-    // Debug log first few draws
-    if (_debugDrawCount < 3) {
-      print(
-          '[Render] Drawing mesh: vertices=${vertices.length}, uvs=${mesh.uvs.length}, indices=${mesh.indices.length}, texId=${texturedMesh?.albedoTextureId}, hasTexture=${texture != null}');
-      _debugDrawCount++;
     }
 
     // Use actual blend mode (clipToLower uses srcATop to clip to previously drawn content)
@@ -166,25 +402,15 @@ class CanvasRenderer {
         combinedBounds = combinedBounds.expandToInclude(maskBounds);
       }
 
-      // Snap mask bounds to integer pixel grid to avoid sub-pixel resampling
-      // when drawing the offscreen mask image back to the main canvas.
-      // Fractional offsets here can introduce fringe outlines on masked parts.
-      final snappedBounds = Rect.fromLTRB(
-        combinedBounds.left.floorToDouble(),
-        combinedBounds.top.floorToDouble(),
-        combinedBounds.right.ceilToDouble(),
-        combinedBounds.bottom.ceilToDouble(),
-      );
-
-      final width = snappedBounds.width.ceil();
-      final height = snappedBounds.height.ceil();
+      final width = combinedBounds.width.ceil();
+      final height = combinedBounds.height.ceil();
       if (width <= 0 || height <= 0) return;
 
       // 2. Render combined mask image offscreen
       final maskImage = _renderMaskImage(
         data.drawable.masks!,
         data.drawable.maskThreshold ?? 0.0,
-        snappedBounds,
+        combinedBounds,
       );
       if (maskImage == null) {
         // No valid mask sources — draw content without masking
@@ -196,7 +422,7 @@ class CanvasRenderer {
       // 3. Render the drawable content to a saveLayer, then apply mask via dstIn
       canvas.save();
       final layerPaint = Paint()..blendMode = blendMode;
-      canvas.saveLayer(snappedBounds, layerPaint);
+      canvas.saveLayer(combinedBounds, layerPaint);
 
       // Draw the actual content
       canvas.save();
@@ -212,15 +438,13 @@ class CanvasRenderer {
           BlendMode.srcOver,
           data.drawable.opacity,
         );
-      } else {
-        _drawWireframe(canvas, vertices, mesh.indices);
       }
       canvas.restore();
 
       // 4. Apply mask using dstIn (keeps content only where mask is opaque)
       canvas.drawImage(
         maskImage,
-        Offset(snappedBounds.left, snappedBounds.top),
+        Offset(combinedBounds.left, combinedBounds.top),
         Paint()..blendMode = BlendMode.dstIn,
       );
       canvas.restore(); // restore saveLayer
@@ -269,12 +493,11 @@ class CanvasRenderer {
           data.drawable.opacity,
         );
       } else {
-        // For normal blend mode without masks, render directly
+        // For normal blend mode without masks, render directly.
         final paint = Paint()
           ..blendMode = BlendMode.srcOver
           ..color = Colors.white.withOpacity(data.drawable.opacity)
-          ..isAntiAlias = false
-          ..filterQuality = _filterQuality;
+          ..filterQuality = FilterQuality.high;
         _drawTexturedTriangles(
           canvas,
           vertices,
@@ -283,13 +506,6 @@ class CanvasRenderer {
           texture,
           paint,
         );
-      }
-    } else {
-      _drawWireframe(canvas, vertices, data.mesh!.indices);
-      if (!_debugLogged) {
-        print(
-            '[Render] No texture for texId=${data.texturedMesh?.albedoTextureId}, drawing wireframe');
-        _debugLogged = true;
       }
     }
 
@@ -314,11 +530,6 @@ class CanvasRenderer {
     BlendMode blendMode,
     double opacity,
   ) {
-    // Debug: log opacity values to understand the issue
-    if (blendMode == BlendMode.multiply && opacity != 1.0) {
-      print('[DEBUG] multiply blend with opacity=$opacity');
-    }
-
     // Calculate bounding box for the mesh
     var minX = double.infinity;
     var minY = double.infinity;
@@ -357,8 +568,7 @@ class CanvasRenderer {
     // Do NOT apply opacity here - it will be applied at composite time
     final trianglePaint = Paint()
       ..blendMode = BlendMode.srcOver
-      ..isAntiAlias = false
-      ..filterQuality = _filterQuality;
+      ..filterQuality = FilterQuality.high;
 
     _drawTexturedTriangles(
       offscreenCanvas,
@@ -393,6 +603,15 @@ class CanvasRenderer {
     picture.dispose();
   }
 
+  /// Draw textured triangles using GPU-accelerated [Canvas.drawVertices].
+  ///
+  /// This delegates triangle rasterization to the GPU, which guarantees
+  /// pixel-perfect edge coverage (top-left rule) and eliminates both gap
+  /// artifacts (epsilon=0) and dark line artifacts (epsilon>0 overlap)
+  /// that plagued the old clip+affine+drawImage approach (Issue #8).
+  ///
+  /// Opacity is applied via vertex colors with [BlendMode.modulate] when
+  /// the paint's color alpha is less than 1.0.
   void _drawTexturedTriangles(
     Canvas canvas,
     List<Vec2> vertices,
@@ -403,93 +622,43 @@ class CanvasRenderer {
   ) {
     if (indices.length < 3) return;
 
-    if (!_useLegacyTriangleClip) {
-      // Inox2D-like path: submit the full mesh once with texture coordinates.
-      // This avoids per-triangle clip edges that can cause fringe lines.
-      final positions = Float32List(vertices.length * 2);
-      final texCoords = Float32List(uvs.length * 2);
-      for (int i = 0; i < vertices.length; i++) {
-        positions[i * 2] = vertices[i].x.toDouble();
-        positions[i * 2 + 1] = vertices[i].y.toDouble();
-      }
-      for (int i = 0; i < uvs.length; i++) {
-        texCoords[i * 2] = (uvs[i].x * texture.width).toDouble();
-        texCoords[i * 2 + 1] = (uvs[i].y * texture.height).toDouble();
-      }
+    // Vertices.raw requires Uint16List indices (max vertex index 65535).
+    // Typical puppet meshes have <1000 vertices; assert to catch anomalies.
+    assert(vertices.length <= 65536,
+        'drawVertices requires <= 65536 vertices, got ${vertices.length}');
 
-      // Validate indices per-triangle so we never break triangle grouping.
-      // Dropping invalid indices element-wise can stitch unrelated vertices
-      // together and create long stray triangles (visible as black bars).
-      final safeTriangleIndices = <int>[];
-      for (int i = 0; i + 2 < indices.length; i += 3) {
-        final i0 = indices[i];
-        final i1 = indices[i + 1];
-        final i2 = indices[i + 2];
-        if (i0 < 0 ||
-            i1 < 0 ||
-            i2 < 0 ||
-            i0 >= vertices.length ||
-            i1 >= vertices.length ||
-            i2 >= vertices.length) {
-          continue;
-        }
-        safeTriangleIndices.add(i0);
-        safeTriangleIndices.add(i1);
-        safeTriangleIndices.add(i2);
-      }
-      final safeIndices = Uint16List.fromList(safeTriangleIndices);
-      if (safeIndices.length < 3) return;
+    final shader = ImageShader(
+      texture,
+      TileMode.clamp,
+      TileMode.clamp,
+      _identityMatrix4,
+      filterQuality: FilterQuality.high,
+    );
 
-      final mesh = ui.Vertices.raw(
-        ui.VertexMode.triangles,
-        positions,
-        textureCoordinates: texCoords,
-        indices: safeIndices,
-      );
-
-      final shader = ui.ImageShader(
-        texture,
-        TileMode.clamp,
-        TileMode.clamp,
-        Float64List.fromList(<double>[
-          1,
-          0,
-          0,
-          0,
-          0,
-          1,
-          0,
-          0,
-          0,
-          0,
-          1,
-          0,
-          0,
-          0,
-          0,
-          1,
-        ]),
-        filterQuality: _filterQuality,
-      );
-      final texturedPaint = Paint()
-        ..blendMode = paint.blendMode
-        ..color = paint.color
-        ..isAntiAlias = false
-        ..filterQuality = _filterQuality
-        ..shader = shader;
-
-      canvas.drawVertices(mesh, BlendMode.modulate, texturedPaint);
-      return;
+    // Build vertex positions (x, y pairs in canvas coordinate space)
+    final positions = Float32List(vertices.length * 2);
+    for (int i = 0; i < vertices.length; i++) {
+      positions[i * 2] = vertices[i].x;
+      positions[i * 2 + 1] = vertices[i].y;
     }
 
-    // Draw textured mesh using affine-transformed texture per triangle
-    for (int i = 0; i < indices.length; i += 3) {
-      if (i + 2 >= indices.length) break;
+    // Build texture coordinates in pixel space (UV × texture dimensions)
+    final texWidth = texture.width.toDouble();
+    final texHeight = texture.height.toDouble();
+    final texCoords = Float32List(uvs.length * 2);
+    for (int i = 0; i < uvs.length; i++) {
+      texCoords[i * 2] = uvs[i].x * texWidth;
+      texCoords[i * 2 + 1] = uvs[i].y * texHeight;
+    }
 
+    // Validate indices per-triangle so we never break triangle grouping.
+    // Dropping invalid indices element-wise can stitch unrelated vertices
+    // together and create long stray triangles (visible as black bars).
+    final safeTriangleIndices = <int>[];
+    for (int i = 0; i + 2 < indices.length; i += 3) {
       final i0 = indices[i];
       final i1 = indices[i + 1];
       final i2 = indices[i + 2];
-
       if (i0 < 0 ||
           i1 < 0 ||
           i2 < 0 ||
@@ -498,121 +667,53 @@ class CanvasRenderer {
           i2 >= vertices.length) {
         continue;
       }
-
-      _drawTexturedTriangle(
-        canvas,
-        vertices[i0],
-        vertices[i1],
-        vertices[i2],
-        uvs[i0],
-        uvs[i1],
-        uvs[i2],
-        texture,
-        paint,
-      );
+      safeTriangleIndices.add(i0);
+      safeTriangleIndices.add(i1);
+      safeTriangleIndices.add(i2);
     }
-  }
+    if (safeTriangleIndices.length < 3) return;
+    final indexList = Uint16List.fromList(safeTriangleIndices);
 
-  void _drawTexturedTriangle(
-    Canvas canvas,
-    Vec2 v0,
-    Vec2 v1,
-    Vec2 v2,
-    Vec2 uv0,
-    Vec2 uv1,
-    Vec2 uv2,
-    ui.Image texture,
-    Paint paint,
-  ) {
-    canvas.save();
-
-    // Expand clip path vertices by sub-pixel epsilon to close gaps between
-    // adjacent triangles. This prevents jagged "tooth" artifacts at triangle
-    // seams, especially visible in hair highlights (Issue #118).
-    // Only the clip path is expanded — texture coordinates remain unchanged.
-    // Too-large expansion can sample outside intended edge texels and cause
-    // dark fringe lines on thin facial parts (e.g. mouth outlines).
-    final epsilon = _inoxLikeNoClipExpand ? 0.0 : 0.1;
-    final cx = (v0.x + v1.x + v2.x) / 3.0;
-    final cy = (v0.y + v1.y + v2.y) / 3.0;
-    final ev0 = expandVertex(v0.x, v0.y, cx, cy, epsilon);
-    final ev1 = expandVertex(v1.x, v1.y, cx, cy, epsilon);
-    final ev2 = expandVertex(v2.x, v2.y, cx, cy, epsilon);
-
-    final path = Path();
-    path.moveTo(ev0.dx, ev0.dy);
-    path.lineTo(ev1.dx, ev1.dy);
-    path.lineTo(ev2.dx, ev2.dy);
-    path.close();
-
-    canvas.clipPath(path);
-
-    // Calculate affine transform from UV coordinates to screen coordinates
-    // We need to solve for the transformation that maps:
-    // uv0 -> v0, uv1 -> v1, uv2 -> v2
-    // This is done using inverse matrix calculation
-
-    final x0 = v0.x, y0 = v0.y;
-    final x1 = v1.x, y1 = v1.y;
-    final x2 = v2.x, y2 = v2.y;
-
-    final u0 = uv0.x, v0_ = uv0.y;
-    final u1 = uv1.x, v1_ = uv1.y;
-    final u2 = uv2.x, v2_ = uv2.y;
-
-    // Compute determinant of UV basis
-    final detUV = u0 * (v1_ - v2_) + u1 * (v2_ - v0_) + u2 * (v0_ - v1_);
-    if (detUV.abs() < 1e-8) {
-      canvas.restore();
-      return;
+    // Handle opacity via vertex colors with modulate blending.
+    // paint.color.opacity carries the drawable's opacity (set by callers).
+    // For drawVertices, we apply it through vertex colors instead.
+    final opacity = paint.color.a;
+    Int32List? colorList;
+    BlendMode vertexBlendMode = BlendMode.srcOver;
+    if (opacity < 1.0) {
+      final alpha = (opacity * 255).round().clamp(0, 255);
+      final colorValue = alpha << 24 | 0x00FFFFFF; // ARGB white with alpha
+      colorList = Int32List(vertices.length);
+      for (int i = 0; i < vertices.length; i++) {
+        colorList[i] = colorValue;
+      }
+      vertexBlendMode = BlendMode.modulate;
     }
 
-    // Compute transformation coefficients
-    // Screen = [ a b c ] [ UV ]
-    //          [ d e f ] [ 1  ]
-    final a = (x0 * (v1_ - v2_) + x1 * (v2_ - v0_) + x2 * (v0_ - v1_)) / detUV;
-    final b = (x0 * (u2 - u1) + x1 * (u0 - u2) + x2 * (u1 - u0)) / detUV;
-    final c = (x0 * (u1 * v2_ - u2 * v1_) +
-            x1 * (u2 * v0_ - u0 * v2_) +
-            x2 * (u0 * v1_ - u1 * v0_)) /
-        detUV;
+    final verts = ui.Vertices.raw(
+      VertexMode.triangles,
+      positions,
+      textureCoordinates: texCoords,
+      indices: indexList,
+      colors: colorList,
+    );
 
-    final d = (y0 * (v1_ - v2_) + y1 * (v2_ - v0_) + y2 * (v0_ - v1_)) / detUV;
-    final e = (y0 * (u2 - u1) + y1 * (u0 - u2) + y2 * (u1 - u0)) / detUV;
-    final f = (y0 * (u1 * v2_ - u2 * v1_) +
-            y1 * (u2 * v0_ - u0 * v2_) +
-            y2 * (u0 * v1_ - u1 * v0_)) /
-        detUV;
+    final drawPaint = Paint()
+      ..shader = shader
+      ..blendMode = paint.blendMode;
 
-    // Scale to convert from texture pixel coordinates to UV coordinates
-    // The affine matrix transforms UV coordinates (0-1) to screen coordinates
-    // Since canvas.drawImage() uses pixel coordinates, we need to normalize them
-    // pixel_coord / dimension = UV coordinate (0-1 range)
-    // Therefore: a' = a / width, b' = b / height, etc.
-    final scaleX = 1.0 / texture.width.toDouble();
-    final scaleY = 1.0 / texture.height.toDouble();
+    canvas.drawVertices(verts, vertexBlendMode, drawPaint);
 
-    // Build transformation matrix (column-major for Flutter)
-    // [0]  [4]  [8]  [12]    [scaleX*a  scaleY*b  0  c]
-    // [1]  [5]  [9]  [13] =  [scaleX*d  scaleY*e  0  f]
-    // [2]  [6]  [10] [14]    [0         0         1  0]
-    // [3]  [7]  [11] [15]    [0         0         0  1]
-    final matrix = Float64List(16);
-    matrix[0] = a * scaleX;
-    matrix[1] = d * scaleX;
-    matrix[4] = b * scaleY;
-    matrix[5] = e * scaleY;
-    matrix[12] = c;
-    matrix[13] = f;
-    matrix[10] = 1.0;
-    matrix[15] = 1.0;
-
-    // Apply transform and draw texture
-    canvas.transform(matrix);
-    canvas.drawImage(texture, Offset.zero, paint);
-
-    canvas.restore();
+    verts.dispose();
+    shader.dispose();
   }
+
+  /// Identity matrix for [ImageShader] (shared, never mutated).
+  static final _identityMatrix4 = Float64List(16)
+    ..[0] = 1.0
+    ..[5] = 1.0
+    ..[10] = 1.0
+    ..[15] = 1.0;
 
   void _drawWireframe(Canvas canvas, List<Vec2> vertices, List<int> indices) {
     final paint = Paint()
@@ -817,8 +918,7 @@ class CanvasRenderer {
       // Render the textured mesh with normal blending
       final paint = Paint()
         ..blendMode = BlendMode.srcOver
-        ..isAntiAlias = false
-        ..filterQuality = _filterQuality;
+        ..filterQuality = FilterQuality.high;
       _drawTexturedTriangles(
         offCanvas,
         sourceVertices,
@@ -866,35 +966,7 @@ class CanvasRenderer {
       }
     }
 
-    if (combinedMask == null) return null;
-
-    // Canvas dstIn masking can shrink the effective mask by sub-pixel amount
-    // compared to stencil-based GL masking. Expand mask coverage by 1px to
-    // avoid dark seam lines on tightly clipped facial parts.
-    final expanded = _expandMaskImage(combinedMask, width, height);
-    combinedMask.dispose();
-    return expanded;
-  }
-
-  /// Expand mask alpha coverage by 1px using additive offsets.
-  ui.Image _expandMaskImage(ui.Image source, int width, int height) {
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder);
-    final paint = Paint()..blendMode = BlendMode.plus;
-    const offsets = <Offset>[
-      Offset(0, 0),
-      Offset(1, 0),
-      Offset(-1, 0),
-      Offset(0, 1),
-      Offset(0, -1),
-    ];
-    for (final o in offsets) {
-      canvas.drawImage(source, o, paint);
-    }
-    final picture = recorder.endRecording();
-    final result = picture.toImageSync(width, height);
-    picture.dispose();
-    return result;
+    return combinedMask;
   }
 
   /// Apply alpha threshold to a mask image.
@@ -1039,69 +1111,65 @@ class CanvasRenderer {
     canvas.transform(matrix4);
   }
 
-  /// Expand vertex position away from centroid by [epsilon] pixels.
+  /// Convert puppet blend mode to Flutter BlendMode.
   ///
-  /// Used to close sub-pixel gaps between adjacent clip-path triangles
-  /// that cause jagged "tooth" artifacts in hair highlights (Issue #118).
-  /// Only the clip path is expanded; texture coordinates remain unchanged.
-  @visibleForTesting
-  static Offset expandVertex(
-      double vx, double vy, double cx, double cy, double epsilon) {
-    final dx = vx - cx;
-    final dy = vy - cy;
-    final len = sqrt(dx * dx + dy * dy);
-    if (len < 1e-10) return Offset(vx, vy);
-    return Offset(
-      vx + dx / len * epsilon,
-      vy + dy / len * epsilon,
-    );
-  }
-
-  /// Convert blend mode to Flutter BlendMode
+  /// Uses [PsdCanvasCompositor.toFlutterBlendMode] for PSD-compatible modes.
+  /// Inochi2d-specific modes (clipToLower, sliceFromLower, etc.) are mapped
+  /// directly to their Flutter equivalents.
   BlendMode _convertBlendMode(puppet.BlendMode mode) {
     switch (mode) {
-      case puppet.BlendMode.normal:
-        return BlendMode.srcOver;
-      case puppet.BlendMode.multiply:
-        return BlendMode.multiply;
-      case puppet.BlendMode.colorDodge:
-        return BlendMode.colorDodge;
-      case puppet.BlendMode.linearDodge:
-        return BlendMode.plus;
-      case puppet.BlendMode.screen:
-        return BlendMode.screen;
+      // Inochi2d-specific modes (no PSD equivalent)
       case puppet.BlendMode.clipToLower:
-        // srcATop: draws source where destination is opaque, preserving destination color beneath
         return BlendMode.srcATop;
       case puppet.BlendMode.sliceFromLower:
-        // srcOut: draws source where destination is transparent
         return BlendMode.srcOut;
-      case puppet.BlendMode.lighten:
-        return BlendMode.lighten;
       case puppet.BlendMode.addGlow:
         return BlendMode.plus;
-      case puppet.BlendMode.subtract:
-        // Approximation: difference gives a similar visual effect
-        return BlendMode.difference;
-      case puppet.BlendMode.overlay:
-        return BlendMode.overlay;
-      case puppet.BlendMode.darken:
-        return BlendMode.darken;
-      case puppet.BlendMode.difference:
-        return BlendMode.difference;
-      case puppet.BlendMode.exclusion:
-        return BlendMode.exclusion;
-      case puppet.BlendMode.colorBurn:
-        return BlendMode.colorBurn;
-      case puppet.BlendMode.hardLight:
-        return BlendMode.hardLight;
-      case puppet.BlendMode.softLight:
-        return BlendMode.softLight;
       case puppet.BlendMode.inverse:
-        // Approximation: xor provides an inverting effect
         return BlendMode.xor;
       case puppet.BlendMode.destinationIn:
         return BlendMode.dstIn;
+      case puppet.BlendMode.exclusion:
+        return BlendMode.exclusion;
+      // PSD-compatible modes → delegate to dart_psd_tool
+      default:
+        return PsdCanvasCompositor.toFlutterBlendMode(
+          _puppetBlendModeToPsdString(mode),
+        );
+    }
+  }
+
+  /// Convert puppet BlendMode enum to PSD blend mode string.
+  static String _puppetBlendModeToPsdString(puppet.BlendMode mode) {
+    switch (mode) {
+      case puppet.BlendMode.normal:
+        return 'Normal';
+      case puppet.BlendMode.multiply:
+        return 'Multiply';
+      case puppet.BlendMode.screen:
+        return 'Screen';
+      case puppet.BlendMode.overlay:
+        return 'Overlay';
+      case puppet.BlendMode.darken:
+        return 'Darken';
+      case puppet.BlendMode.lighten:
+        return 'Lighten';
+      case puppet.BlendMode.colorDodge:
+        return 'ColorDodge';
+      case puppet.BlendMode.colorBurn:
+        return 'ColorBurn';
+      case puppet.BlendMode.hardLight:
+        return 'HardLight';
+      case puppet.BlendMode.softLight:
+        return 'SoftLight';
+      case puppet.BlendMode.difference:
+        return 'Difference';
+      case puppet.BlendMode.subtract:
+        return 'Subtract';
+      case puppet.BlendMode.linearDodge:
+        return 'LinearDodge';
+      default:
+        return 'Normal';
     }
   }
 }

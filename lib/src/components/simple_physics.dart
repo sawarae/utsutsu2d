@@ -20,6 +20,11 @@ class SimplePhysics {
   /// Parameter to map physics output to
   String? mapParamId;
 
+  /// Input parameter whose value drives the pendulum anchor displacement.
+  /// When this parameter changes (e.g., head angle), the anchor moves,
+  /// causing the pendulum bob to lag and create sway.
+  String? inputParamId;
+
   /// How to map physics to parameter
   PhysicsParamMapMode mapMode;
 
@@ -47,6 +52,7 @@ class SimplePhysics {
   SimplePhysics({
     this.model = PhysicsModel.springPendulum,
     this.mapParamId,
+    this.inputParamId,
     this.mapMode = PhysicsParamMapMode.xyProjection,
     this.localGravity,
     this.length = 100.0,
@@ -73,6 +79,7 @@ class SimplePhysics {
       'output_scale': outputScale,
     };
     if (mapParamId != null) json['map_param_id'] = mapParamId;
+    if (inputParamId != null) json['input_param_id'] = inputParamId;
     if (localGravity != null) {
       json['local_gravity'] = [localGravity!.x, localGravity!.y];
     }
@@ -84,7 +91,8 @@ class SimplePhysics {
       model: json['model'] == 'rigid_pendulum'
           ? PhysicsModel.rigidPendulum
           : PhysicsModel.springPendulum,
-      mapParamId: json['map_param_id'],
+      mapParamId: json['map_param_id']?.toString(),
+      inputParamId: json['input_param_id']?.toString(),
       mapMode: json['map_mode'] == 'angle_length'
           ? PhysicsParamMapMode.angleLength
           : PhysicsParamMapMode.xyProjection,

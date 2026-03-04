@@ -183,7 +183,9 @@ class CanvasRenderer {
         flushBatch();
 
         // Render mesh content to image (normal blend, full opacity)
-        final srcImage = _renderMeshContentToImage(data, size, pw, ph);
+        final srcImage = data.drawable.hasMasks
+            ? _renderMaskedMeshContentToImage(data, size, pw, ph)
+            : _renderMeshContentToImage(data, size, pw, ph);
         if (srcImage == null) {
           startBatch();
           continue;
@@ -238,7 +240,6 @@ class CanvasRenderer {
   bool _needsPsdShaderPath(RenderData data) {
     if (psdCompositor == null) return false;
     if (data.kind != DrawableKind.texturedMesh) return false;
-    if (data.drawable.hasMasks) return false;
     final mode = data.drawable.blendMode;
     if (mode == puppet.BlendMode.normal) return false;
     // Inochi2d-specific modes without PSD equivalent — use Flutter built-in
@@ -305,6 +306,93 @@ class CanvasRenderer {
     final image = picture.toImageSync(pw, ph);
     picture.dispose();
     return image;
+  }
+
+  /// Render a textured mesh to a screen-space image and apply texture-aware
+  /// masking before shader compositing.
+  ui.Image? _renderMaskedMeshContentToImage(
+      RenderData data, Size size, int pw, int ph) {
+    final contentImage = _renderMeshContentToImage(data, size, pw, ph);
+    if (contentImage == null) return null;
+
+    final masks = data.drawable.masks;
+    if (masks == null || masks.isEmpty) {
+      return contentImage;
+    }
+
+    final maskImage = _renderMaskImageScreenSpace(
+      masks,
+      data.drawable.maskThreshold ?? 0.0,
+      size,
+      pw,
+      ph,
+    );
+    if (maskImage == null) {
+      return contentImage;
+    }
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    canvas.drawImage(contentImage, Offset.zero, Paint());
+    canvas.drawImage(
+      maskImage,
+      Offset.zero,
+      Paint()..blendMode = BlendMode.dstIn,
+    );
+    final picture = recorder.endRecording();
+    contentImage.dispose();
+    maskImage.dispose();
+    final result = picture.toImageSync(pw, ph);
+    picture.dispose();
+    return result;
+  }
+
+  /// Render mask sources to a full-screen screen-space image.
+  ui.Image? _renderMaskImageScreenSpace(
+    List<puppet.Mask> masks,
+    double threshold,
+    Size size,
+    int pw,
+    int ph,
+  ) {
+    ui.Image? combinedMask;
+
+    for (final mask in masks) {
+      final sourceData = renderCtx.getRenderData(mask.sourceNodeId);
+      if (sourceData == null || sourceData.mesh == null) continue;
+
+      final maskImage = _renderMeshContentToImage(sourceData, size, pw, ph);
+      if (maskImage == null) continue;
+
+      final thresholdedImage = _applyThresholdToImage(
+        maskImage,
+        threshold,
+        pw,
+        ph,
+        invert: mask.mode == puppet.MaskMode.dodge,
+      );
+      maskImage.dispose();
+
+      if (combinedMask == null) {
+        combinedMask = thresholdedImage;
+      } else {
+        final recorder = ui.PictureRecorder();
+        final canvas = Canvas(recorder);
+        canvas.drawImage(combinedMask, Offset.zero, Paint());
+        canvas.drawImage(
+          thresholdedImage,
+          Offset.zero,
+          Paint()..blendMode = BlendMode.dstIn,
+        );
+        final picture = recorder.endRecording();
+        combinedMask.dispose();
+        thresholdedImage.dispose();
+        combinedMask = picture.toImageSync(pw, ph);
+        picture.dispose();
+      }
+    }
+
+    return combinedMask;
   }
 
   /// Create a transparent image of the given dimensions.
